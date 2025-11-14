@@ -137,7 +137,7 @@ mode = st.sidebar.radio("Choose data source:", ["Use existing Excel", "Upload XM
 if mode == "Use existing Excel":
     excel_file = st.sidebar.text_input("Path to Excel", DEFAULT_EXCEL)
     if not os.path.exists(excel_file):
-        st.error(f\"Excel not found: {excel_file}. Upload XMLs instead or place the file next to the app.\")
+       st.error(f"Excel not found: {excel_file}. Upload XMLs instead or place the file next to the app.")
         st.stop()
     df_summary = pd.read_excel(excel_file, sheet_name="Summary")
     try:
