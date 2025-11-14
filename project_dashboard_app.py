@@ -138,7 +138,7 @@ if mode == "Use existing Excel":
     excel_file = st.sidebar.text_input("Path to Excel", DEFAULT_EXCEL)
     if not os.path.exists(excel_file):
        st.error(f"Excel not found: {excel_file}. Upload XMLs instead or place the file next to the app.")
-        st.stop()
+    st.stop()
     df_summary = pd.read_excel(excel_file, sheet_name="Summary")
     try:
         df_all_open = pd.read_excel(excel_file, sheet_name="AllOpenActions")
