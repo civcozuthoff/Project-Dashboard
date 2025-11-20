@@ -6,6 +6,8 @@ from matplotlib.dates import AutoDateLocator, ConciseDateFormatter
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
 
 # ================= App config & global plot style =================
 st.set_page_config(page_title="Project Portfolio Dashboard", layout="wide")
@@ -41,10 +43,10 @@ def load_notes():
         try:
             return pd.read_csv(p)
         except Exception:
-            return pd.DataFrame(columns=["Timestamp", "Project", "Author", "Note"])
-    return pd.DataFrame(columns=["Timestamp", "Project", "Author", "Note"])
+            return pd.DataFrame(columns=["Timestamp", "Project", "Author", "Email", "Note"])
+    return pd.DataFrame(columns=["Timestamp", "Project", "Author", "Email", "Note"])
 
-def append_note(project: str, author: str, note: str):
+def append_note(project: str, author: str, email_to: str, note: str):
     if not note or not note.strip():
         return
     df = load_notes()
@@ -52,10 +54,35 @@ def append_note(project: str, author: str, note: str):
         "Timestamp": datetime.now().isoformat(timespec="seconds"),
         "Project": (project or "").strip(),
         "Author": (author or "Anonymous").strip(),
+        "Email": (email_to or "").strip(),
         "Note": note.strip()
     }])
     out = pd.concat([df, new], ignore_index=True)
     out.to_csv(NOTES_STORE, index=False)
+
+def send_email(smtp_host: str, smtp_port: int, smtp_user: str, smtp_pass: str,
+               to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    """Send a simple plain-text email via SMTP. Returns (ok, message)."""
+    try:
+        if not (smtp_host and smtp_port and to_email):
+            return False, "SMTP host/port or recipient email missing."
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = smtp_user or "dashboard@localhost"
+        msg["To"] = to_email
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            server.ehlo()
+            # Try STARTTLS if available
+            try:
+                server.starttls()
+            except Exception:
+                pass
+            if smtp_user and smtp_pass:
+                server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return True, "Email sent."
+    except Exception as e:
+        return False, f"Email failed: {e}"
 
 def small_line(df, xcol, ycol, title):
     fig, ax = plt.subplots(figsize=(6, 3.6))  # 2-across layout
@@ -76,6 +103,21 @@ def small_line(df, xcol, ycol, title):
         pass
 
     fig.tight_layout()
+    st.pyplot(fig)
+
+def donut_chart(pct: float, title: str):
+    """Draw a simple donut chart for a percentage."""
+    pct = max(0.0, min(100.0, pct))
+    fig, ax = plt.subplots(figsize=(6, 3.6))
+    vals = [pct, 100 - pct]
+    wedges, _ = ax.pie(vals, startangle=90)
+    # donut hole
+    centre_circle = plt.Circle((0, 0), 0.60, fc="white")
+    fig.gca().add_artist(centre_circle)
+    ax.set_title(title)
+    # center label
+    ax.text(0, 0, f"{pct:.1f}%", ha="center", va="center", fontsize=14, fontweight="bold")
+    ax.axis("equal")
     st.pyplot(fig)
 
 # ================= XML Parsing =================
@@ -241,7 +283,7 @@ st.title("Project Portfolio Dashboard")
 st.sidebar.header("Data Source")
 mode = st.sidebar.radio("Choose data source:", ["Upload XML files", "Upload Excel export"])
 
-df_summary = pd.DataBox() if False else pd.DataFrame()  # sentinel trick for readability
+df_summary = pd.DataFrame()
 df_all_open = pd.DataFrame()
 df_all_tasks = pd.DataFrame()
 df_owner_pairs_all = pd.DataFrame()
@@ -262,6 +304,7 @@ if mode == "Upload XML files":
                 continue
             if summary: summaries.append(summary)
             if open_df is not None and not open_df.empty: open_frames.append(open_df)
+            if tasks_df is not None and not task_frames: pass
             if tasks_df is not None and not tasks_df.empty: task_frames.append(tasks_df)
             if owners_df is not None and not owners_df.empty:
                 owners_df = owners_df.copy()
@@ -426,6 +469,83 @@ if not df_open_f.empty:
 with colD:
     st.empty()
 
+# ================= Master Resource Utilization (Portfolio) =================
+st.subheader("Master Resource Utilization (Open Tasks per Month)")
+if not df_all_tasks.empty:
+    # Build Owner mapping across all tasks
+    if not df_owner_pairs_all.empty:
+        owners_map_all = df_owner_pairs_all[["TaskUID", "Owner", "Project"]]
+        t_all = df_all_tasks.merge(owners_map_all, on=["TaskUID", "Project"], how="left")
+        t_all["Owner"] = t_all["Owner"].fillna("Unassigned")
+    else:
+        t_all = df_all_tasks.copy()
+        t_all["Owner"] = (
+            t_all.get("ResourceNamesInline", "")
+            .astype(str).str.replace(";", ",").str.split(",").str[0].str.strip().fillna("Unassigned")
+        )
+    # Use OPEN tasks only for utilization (current workload proxy)
+    open_all = t_all[t_all["IsOpenAction"] & (~t_all["IsSummary"]) & (t_all["TaskName"].str.len() > 0)].copy()
+    if not open_all.empty:
+        dates = pd.to_datetime(open_all["Start"]).fillna(pd.to_datetime(open_all["Finish"]))
+        open_all = open_all.assign(Month=dates.dt.to_period("M").astype(str))
+        util = open_all.groupby(["Owner", "Month"]).size().reset_index(name="Tasks")
+        pivot = util.pivot(index="Owner", columns="Month", values="Tasks").fillna(0)
+        figU, axU = plt.subplots(figsize=(10, 6))
+        im = axU.imshow(pivot.values, aspect="auto")
+        axU.set_title("Open Task Count per Resource per Month (proxy for hours)")
+        axU.set_yticks(range(len(pivot.index))); axU.set_yticklabels(pivot.index)
+        axU.set_xticks(range(len(pivot.columns))); axU.set_xticklabels(pivot.columns, rotation=45, ha="right")
+        for i in range(pivot.shape[0]):
+            for j in range(pivot.shape[1]):
+                axU.text(j, i, int(pivot.values[i, j]), ha="center", va="center", fontsize=8)
+        figU.tight_layout()
+        st.pyplot(figU)
+    else:
+        st.caption("No open tasks available to build utilization.")
+
+# ================= Resource Explorer =================
+st.subheader("Resource Explorer (Active Tasks)")
+if not df_all_tasks.empty:
+    # Build list of owners from assignments or inline
+    if not df_owner_pairs_all.empty:
+        owners_list = sorted(df_owner_pairs_all["Owner"].dropna().unique().tolist())
+    else:
+        inline = (
+            df_all_tasks["ResourceNamesInline"].dropna()
+            .astype(str).str.replace(";", ",").str.split(",").explode()
+        )
+        owners_list = sorted({s.strip() for s in inline if s and s.strip()})
+    if owners_list:
+        selected_owner = st.selectbox("Select a resource", owners_list)
+        if selected_owner:
+            # Map owners to tasks (best-effort)
+            if not df_owner_pairs_all.empty:
+                m = df_owner_pairs_all[df_owner_pairs_all["Owner"] == selected_owner][["TaskUID", "Project"]]
+                my_tasks = df_all_tasks.merge(m, on=["TaskUID", "Project"], how="inner")
+            else:
+                my_tasks = df_all_tasks[df_all_tasks["ResourceNamesInline"].fillna("").str.contains(selected_owner, case=False, na=False)].copy()
+            # Filter active, non-summary, named
+            my_open = my_tasks[my_tasks["IsOpenAction"] & (~my_tasks["IsSummary"]) & (my_tasks["TaskName"].str.len() > 0)]
+            st.markdown(f"**Active Tasks for:** {selected_owner}")
+            if not my_open.empty:
+                st.dataframe(
+                    my_open[["Project","TaskName","Start","Finish","Critical","PercentComplete","Notes"]]
+                    .sort_values(["Project","Finish","TaskName"])
+                )
+                # quick workload by project
+                w = my_open.groupby("Project")["TaskUID"].count().reset_index(name="OpenActions").sort_values("OpenActions", ascending=False)
+                figW, axW = plt.subplots(figsize=(6, 3.6))
+                axW.bar(w["Project"], w["OpenActions"])
+                axW.set_title("Open Actions by Project")
+                axW.set_xlabel("Project"); axW.set_ylabel("OpenActions")
+                axW.tick_params(axis="x", rotation=45)
+                figW.tight_layout()
+                st.pyplot(figW)
+            else:
+                st.caption("No active tasks for this resource.")
+    else:
+        st.caption("No resources found.")
+
 # ================= Focus: Late & Upcoming =================
 st.subheader("Focus: Late and Upcoming")
 
@@ -456,7 +576,7 @@ if not df_open_f.empty:
     upcoming["Finish"] = pd.to_datetime(upcoming["Finish"], errors="coerce")
     upcoming = upcoming[
         (upcoming["TaskName"].str.len() > 0) &
-        upcoming["Finish"].notna() &
+        (upcoming["Finish"].notna()) &
         (upcoming["Finish"] >= today) &
         (upcoming["PercentComplete"] < 100) &
         (upcoming["ActualFinish"].isna())
@@ -482,32 +602,23 @@ if not df_all_tasks.empty:
         (dfc["ActualFinish"].notna()) &
         (dfc["Finish"].notna())
     ].copy()
-
-    # Planned = BaselineFinish if available, else Finish
     dfc["PlannedFinish"] = dfc["BaselineFinish"].where(dfc["BaselineFinish"].notna(), dfc["Finish"])
-
-    # On-time if ActualFinish <= PlannedFinish
     dfc["OnTime"] = pd.to_datetime(dfc["ActualFinish"]) <= pd.to_datetime(dfc["PlannedFinish"])
-
-    # Limit to filtered projects
     dfc = dfc[dfc["Project"].isin(df_summary_f["ProjectName"])]
 
     if not dfc.empty:
-        overall_pct = round(100 * dfc["OnTime"].mean(), 1)
+        overall_pct = float(round(100 * dfc["OnTime"].mean(), 1))
         oa, ob = st.columns(2)
         with oa:
-            st.metric("Overall On-Time % (completed tasks)", f"{overall_pct}%")
-
-        proj_rates = (
-            dfc.groupby("Project")["OnTime"]
-               .mean()
-               .mul(100)
-               .round(1)
-               .reset_index(name="OnTimePct")
-               .sort_values("OnTimePct", ascending=False)
-        )
+            donut_chart(overall_pct, "Overall On-Time % (completed tasks)")
         with ob:
-            fig3, ax3 = plt.subplots(figsize=(6, 3.6))
+            proj_rates = (
+                dfc.groupby("Project")["OnTime"]
+                   .mean().mul(100).round(1)
+                   .reset_index(name="OnTimePct")
+                   .sort_values("OnTimePct", ascending=False)
+            )
+            fig3, ax3 = plt.subplots(figsize=(12, 7))
             ax3.bar(proj_rates["Project"], proj_rates["OnTimePct"])
             ax3.set_title("On-Time % by Project")
             ax3.set_xlabel("Project"); ax3.set_ylabel("On-Time %")
@@ -521,18 +632,15 @@ if not df_all_tasks.empty:
         dfc["Month"] = pd.to_datetime(dfc["ActualFinish"]).dt.to_period("M").astype(str)
         trend = (
             dfc.groupby("Month")["OnTime"]
-               .mean()
-               .mul(100)
-               .round(1)
+               .mean().mul(100).round(1)
                .reset_index(name="OnTimePct")
                .sort_values("Month")
         )
         if not trend.empty:
-            fig4, ax4 = plt.subplots(figsize=(10, 5.6))
+            fig4, ax4 = plt.subplots(figsize=(14, 8))
             ax4.plot(trend["Month"], trend["OnTimePct"], marker="o")
             ax4.set_title("On-Time Completion % by Month")
-            ax4.set_xlabel("Month")
-            ax4.set_ylabel("On-Time %")
+            ax4.set_xlabel("Month"); ax4.set_ylabel("On-Time %")
             ax4.set_ylim(0, 100)
             ax4.grid(True, alpha=0.3)
             fig4.tight_layout()
@@ -544,16 +652,41 @@ if not df_all_tasks.empty:
 else:
     st.caption("No task data available yet.")
 
-# ================= Project Notes (shared) =================
+# ================= Project Notes (shared + optional email) =================
 st.subheader("Project Notes (shared)")
+st.caption(f"Notes are saved to: **{NOTES_STORE}** (point this to a shared path/SharePoint sync for team visibility).")
+
 note_col1, note_col2 = st.columns([2, 3])
 with note_col1:
     prj_for_note = st.selectbox("Select project", df_summary_f["ProjectName"].tolist())
     author = st.text_input("Your name", value="")
-    note_text = st.text_area("Add a note (stored in a shared CSV)", height=80, placeholder="Type an update or decision…")
+    owner_email = st.text_input("Recipient email (e.g., project owner)", value="", placeholder="owner@company.com")
+    note_text = st.text_area("Add a note (stored in CSV, can email if configured)", height=100, placeholder="Type an update or decision…")
+    email_toggle = st.checkbox("Email this note to recipient", value=False)
+
+    # Simple SMTP settings (optional)
+    with st.expander("Email settings (SMTP)", expanded=False):
+        smtp_host = st.text_input("SMTP server (host)", value="")
+        smtp_port = st.number_input("SMTP port", value=587, step=1)
+        smtp_user = st.text_input("SMTP username (optional)", value="")
+        smtp_pass = st.text_input("SMTP password (optional)", type="password", value="")
+
     if st.button("Save note"):
-        append_note(prj_for_note, author, note_text)
+        append_note(prj_for_note, author, owner_email, note_text)
         st.success("Note saved.")
+        if email_toggle and owner_email:
+            ok, msg = send_email(
+                smtp_host=smtp_host, smtp_port=int(smtp_port),
+                smtp_user=smtp_user, smtp_pass=smtp_pass,
+                to_email=owner_email,
+                subject=f"[Project {prj_for_note}] Dashboard Note from {author or 'Anonymous'}",
+                body=note_text
+            )
+            if ok:
+                st.success("Email sent to recipient.")
+            else:
+                st.warning(msg)
+
 with note_col2:
     notes_df = load_notes()
     if not notes_df.empty:
@@ -563,6 +696,38 @@ with note_col2:
         st.dataframe(notes_df.sort_values("Timestamp", ascending=False))
     else:
         st.caption("No notes yet. Be the first to add one!")
+
+# ================= Master Project Timeline (Bull vs Bear) =================
+st.subheader("Master Timeline (Bull vs Bear Finish)")
+if not df_summary_f.empty:
+    # Build data
+    tline = df_summary_f[["ProjectName","BullFinish","BearFinish"]].copy()
+    tline["BullFinish"] = pd.to_datetime(tline["BullFinish"])
+    tline["BearFinish"] = pd.to_datetime(tline["BearFinish"])
+    tline = tline.dropna(subset=["BullFinish", "BearFinish"])
+    if not tline.empty:
+        tline = tline.sort_values("BearFinish")  # sort by Bear (latest)
+        y = np.arange(len(tline))
+        figT, axT = plt.subplots(figsize=(10, 0.5 * len(tline) + 1.5))
+        for i, row in enumerate(tline.itertuples(index=False)):
+            lo = min(row.BullFinish, row.BearFinish)
+            hi = max(row.BullFinish, row.BearFinish)
+            axT.hlines(y=i, xmin=lo, xmax=hi, color="tab:blue", linewidth=3, alpha=0.6)
+            axT.plot(lo, i, "o", label="Bull" if i == 0 else "", markersize=6)
+            axT.plot(hi, i, "s", label="Bear" if i == 0 else "", markersize=6)
+        axT.set_yticks(y)
+        axT.set_yticklabels(tline["ProjectName"])
+        axT.set_title("Bull (●) and Bear (■) Completion Dates by Project")
+        axT.grid(axis="x", alpha=0.2)
+        locator = AutoDateLocator()
+        axT.xaxis.set_major_locator(locator)
+        axT.xaxis.set_major_formatter(ConciseDateFormatter(locator))
+        if len(tline) > 1:
+            axT.legend(loc="upper right")
+        figT.tight_layout()
+        st.pyplot(figT)
+    else:
+        st.caption("No Bull/Bear finish dates available to plot.")
 
 # ================= Project Detail =================
 st.subheader("Project Detail")
@@ -633,7 +798,7 @@ if not df_all_tasks.empty:
                 # Placeholder Resource Utilization heatmap (task counts per month)
                 if not df_owner_pairs_all.empty:
                     owners_map = df_owner_pairs_all[df_owner_pairs_all["Project"] == prj][["TaskUID", "Owner"]]
-                    tproj = tdf.merge(owners_map, on="TaskUID", how="left")
+                    tproj = tdf.merge(owners_map, on=["TaskUID"], how="left")
                 else:
                     tproj = tdf.copy()
                     tproj["Owner"] = (
@@ -655,7 +820,6 @@ if not df_all_tasks.empty:
                     ax5.set_title("Task Count per Month (proxy for hours)")
                     ax5.set_yticks(range(len(pivot.index))); ax5.set_yticklabels(pivot.index)
                     ax5.set_xticks(range(len(pivot.columns))); ax5.set_xticklabels(pivot.columns, rotation=45, ha="right")
-                    # annotate cells
                     for i in range(pivot.shape[0]):
                         for j in range(pivot.shape[1]):
                             ax5.text(j, i, int(pivot.values[i, j]), ha="center", va="center", fontsize=8)
