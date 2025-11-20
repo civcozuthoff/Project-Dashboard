@@ -10,7 +10,7 @@ from datetime import datetime
 # ================= App config & global plot style =================
 st.set_page_config(page_title="Project Portfolio Dashboard", layout="wide")
 
-# Smaller, cleaner typography
+# Smaller, cleaner typography (fits 2-across charts without overlap)
 plt.rcParams.update({
     "axes.titlesize": 10,
     "axes.labelsize": 8,
@@ -22,6 +22,7 @@ plt.rcParams.update({
 # ================= Constants =================
 ns = {"msproj": "http://schemas.microsoft.com/project"}
 # Store team notes in a CSV (point this to a shared path/UNC to collaborate)
+# e.g., NOTES_STORE = r"\\CIVCO-FS\Projects\Dashboard\dashboard_notes.csv"
 NOTES_STORE = "dashboard_notes.csv"
 
 # ================= Utilities =================
@@ -67,7 +68,7 @@ def small_line(df, xcol, ycol, title):
     # Concise datetime ticks if applicable
     try:
         series = pd.Series(df[xcol])
-        if pd.api.types.is_datetime64_any_dtype(series) or hasattr(series.iloc[0], "year"):
+        if pd.api.types.is_datetime64_any_dtype(series) or (len(series) and hasattr(series.iloc[0], "year")):
             locator = AutoDateLocator()
             ax.xaxis.set_major_locator(locator)
             ax.xaxis.set_major_formatter(ConciseDateFormatter(locator))
@@ -129,6 +130,15 @@ def parse_project_xml(file_like):
         start_task = parse_dt(tg("Start"))
         finish_task = parse_dt(tg("Finish"))
         actual_finish = parse_dt(tg("ActualFinish"))
+
+        # --- Baseline (use first baseline if present) ---
+        baseline_finish = None
+        for bl in t.findall("msproj:Baseline", ns):
+            fin_el = bl.find("msproj:Finish", ns)
+            if fin_el is not None and fin_el.text:
+                baseline_finish = parse_dt(fin_el.text)
+                break  # take first available baseline finish
+
         critical = (tg("Critical", "0") == "1")
         milestone = (tg("Milestone", "0") == "1")
         notes = tg("Notes", "")
@@ -156,6 +166,7 @@ def parse_project_xml(file_like):
             "Start": start_task,
             "Finish": finish_task,
             "ActualFinish": actual_finish,
+            "BaselineFinish": baseline_finish,
             "Notes": notes,
             "ResourceNamesInline": res_inline,
             "Predecessors": preds,
@@ -230,7 +241,7 @@ st.title("Project Portfolio Dashboard")
 st.sidebar.header("Data Source")
 mode = st.sidebar.radio("Choose data source:", ["Upload XML files", "Upload Excel export"])
 
-df_summary = pd.DataFrame()
+df_summary = pd.DataBox() if False else pd.DataFrame()  # sentinel trick for readability
 df_all_open = pd.DataFrame()
 df_all_tasks = pd.DataFrame()
 df_owner_pairs_all = pd.DataFrame()
@@ -411,81 +422,7 @@ if not df_open_f.empty:
             ax2.tick_params(axis="x", rotation=45)
             fig2.tight_layout()
             st.pyplot(fig2)
-# ================= On-Time Completion =================
-st.subheader("On-Time Task Completion %")
 
-# Completed, non-summary tasks with both planned and actual dates
-if not df_all_tasks.empty:
-    dfc = df_all_tasks.copy()
-    dfc = dfc[
-        (~dfc["IsSummary"]) &
-        (dfc["ActualFinish"].notna()) &
-        (dfc["Finish"].notna())
-    ].copy()
-
-    # Choose planned date = BaselineFinish if available, else Finish
-    dfc["PlannedFinish"] = dfc["BaselineFinish"].where(dfc["BaselineFinish"].notna(), dfc["Finish"])
-
-    # On-time if ActualFinish <= PlannedFinish
-    dfc["OnTime"] = dfc["ActualFinish"] <= dfc["PlannedFinish"]
-
-    # Limit to filtered projects
-    dfc = dfc[dfc["Project"].isin(df_summary_f["ProjectName"])]
-
-    if not dfc.empty:
-        overall_pct = round(100 * dfc["OnTime"].mean(), 1)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Overall On-Time % (completed tasks)", f"{overall_pct}%")
-
-        # Per-project %
-        proj_rates = (
-            dfc.groupby("Project")["OnTime"]
-               .mean()
-               .mul(100)
-               .round(1)
-               .reset_index(name="OnTimePct")
-               .sort_values("OnTimePct", ascending=False)
-        )
-        with c2:
-            fig, ax = plt.subplots(figsize=(6, 3.6))
-            ax.bar(proj_rates["Project"], proj_rates["OnTimePct"])
-            ax.set_title("On-Time % by Project")
-            ax.set_xlabel("Project"); ax.set_ylabel("On-Time %")
-            ax.set_ylim(0, 100)
-            ax.tick_params(axis="x", rotation=45)
-            fig.tight_layout()
-            st.pyplot(fig)
-    else:
-        st.caption("No completed tasks with both Actual Finish and planned dates found.")
-else:
-    st.caption("No task data available yet.")
-
-        # Monthly trend of on-time completion
-        st.markdown("**Monthly Trend – On-Time Completion**")
-        dfc["Month"] = pd.to_datetime(dfc["ActualFinish"]).dt.to_period("M").astype(str)
-        trend = (
-            dfc.groupby("Month")["OnTime"]
-               .mean()
-               .mul(100)
-               .round(1)
-               .reset_index(name="OnTimePct")
-               .sort_values("Month")
-        )
-        if not trend.empty:
-            fig3, ax3 = plt.subplots(figsize=(6, 3.6))
-            ax3.plot(trend["Month"], trend["OnTimePct"], marker="o")
-            ax3.set_title("On-Time Completion % by Month")
-            ax3.set_xlabel("Month")
-            ax3.set_ylabel("On-Time %")
-            ax3.set_ylim(0, 100)
-            ax3.grid(True, alpha=0.3)
-            fig3.tight_layout()
-            st.pyplot(fig3)
-        else:
-            st.caption("No on-time completion trend data available.")
-
-# Placeholder for second chart spot if you want to add more
 with colD:
     st.empty()
 
@@ -513,7 +450,7 @@ if not df_open_f.empty:
         st.markdown("**Top 5 Late Tasks (by days late)**")
         st.dataframe(top5[["Project","TaskName","Owner","Finish","DaysLate","Critical","PercentComplete","Notes"]])
 
-# Next 3 upcoming per project (strict open, not summary, named)
+# Next 3 Upcoming (strict open, not summary, named)
 if not df_open_f.empty:
     upcoming = df_open_f[~df_open_f["IsSummary"]].copy()
     upcoming["Finish"] = pd.to_datetime(upcoming["Finish"], errors="coerce")
@@ -533,6 +470,79 @@ if not df_open_f.empty:
         if not nxt.empty:
             show_cols = ["Project","TaskName","Finish","Critical","PercentComplete","Notes"]
             st.dataframe(nxt[show_cols])
+
+# ================= On-Time Task Completion =================
+st.subheader("On-Time Task Completion %")
+
+# Completed, non-summary tasks with planned (BaselineFinish or Finish) + ActualFinish
+if not df_all_tasks.empty:
+    dfc = df_all_tasks.copy()
+    dfc = dfc[
+        (~dfc["IsSummary"]) &
+        (dfc["ActualFinish"].notna()) &
+        (dfc["Finish"].notna())
+    ].copy()
+
+    # Planned = BaselineFinish if available, else Finish
+    dfc["PlannedFinish"] = dfc["BaselineFinish"].where(dfc["BaselineFinish"].notna(), dfc["Finish"])
+
+    # On-time if ActualFinish <= PlannedFinish
+    dfc["OnTime"] = pd.to_datetime(dfc["ActualFinish"]) <= pd.to_datetime(dfc["PlannedFinish"])
+
+    # Limit to filtered projects
+    dfc = dfc[dfc["Project"].isin(df_summary_f["ProjectName"])]
+
+    if not dfc.empty:
+        overall_pct = round(100 * dfc["OnTime"].mean(), 1)
+        oa, ob = st.columns(2)
+        with oa:
+            st.metric("Overall On-Time % (completed tasks)", f"{overall_pct}%")
+
+        proj_rates = (
+            dfc.groupby("Project")["OnTime"]
+               .mean()
+               .mul(100)
+               .round(1)
+               .reset_index(name="OnTimePct")
+               .sort_values("OnTimePct", ascending=False)
+        )
+        with ob:
+            fig3, ax3 = plt.subplots(figsize=(6, 3.6))
+            ax3.bar(proj_rates["Project"], proj_rates["OnTimePct"])
+            ax3.set_title("On-Time % by Project")
+            ax3.set_xlabel("Project"); ax3.set_ylabel("On-Time %")
+            ax3.set_ylim(0, 100)
+            ax3.tick_params(axis="x", rotation=45)
+            fig3.tight_layout()
+            st.pyplot(fig3)
+
+        # Monthly trend by ActualFinish month
+        st.markdown("**Monthly Trend – On-Time Completion**")
+        dfc["Month"] = pd.to_datetime(dfc["ActualFinish"]).dt.to_period("M").astype(str)
+        trend = (
+            dfc.groupby("Month")["OnTime"]
+               .mean()
+               .mul(100)
+               .round(1)
+               .reset_index(name="OnTimePct")
+               .sort_values("Month")
+        )
+        if not trend.empty:
+            fig4, ax4 = plt.subplots(figsize=(6, 3.6))
+            ax4.plot(trend["Month"], trend["OnTimePct"], marker="o")
+            ax4.set_title("On-Time Completion % by Month")
+            ax4.set_xlabel("Month")
+            ax4.set_ylabel("On-Time %")
+            ax4.set_ylim(0, 100)
+            ax4.grid(True, alpha=0.3)
+            fig4.tight_layout()
+            st.pyplot(fig4)
+        else:
+            st.caption("No on-time completion trend data available.")
+    else:
+        st.caption("No completed tasks with both Actual Finish and planned dates found.")
+else:
+    st.caption("No task data available yet.")
 
 # ================= Project Notes (shared) =================
 st.subheader("Project Notes (shared)")
@@ -584,7 +594,7 @@ if not df_all_tasks.empty:
                 else:
                     st.caption("No resources found for this project.")
 
-                # Bull/Bear FIRST (moved above Critical Path)
+                # Bull/Bear FIRST (above Critical Path)
                 row = df_summary[df_summary["ProjectName"] == prj].iloc[0]
                 st.markdown("**Bull / Bear Finish**")
                 st.caption("Bull = planned finish; Bear = latest finish among open critical tasks (else open tasks/planned).")
@@ -601,7 +611,8 @@ if not df_all_tasks.empty:
                 cta, ctb = st.columns(2)
 
                 with cta:
-                    odf = df_open_f[df_open_f["Project"] == prj].dropna(subset=["Finish"])
+                    odf = df_all_open[(df_all_open["Project"] == prj)]
+                    odf = odf.dropna(subset=["Finish"])
                     if not odf.empty:
                         bd = (
                             odf.assign(FinishDate=lambda d: pd.to_datetime(d["Finish"]).dt.to_period("M").dt.to_timestamp())
@@ -611,22 +622,20 @@ if not df_all_tasks.empty:
                         small_line(bd, "FinishDate", "OpenTasks", "Burndown")
 
                 with ctb:
-                    open_n = int(df_open_f[df_open_f["Project"] == prj].shape[0]) if not df_open_f.empty else 0
+                    open_n = int(df_all_open[df_all_open["Project"] == prj].shape[0]) if not df_all_open.empty else 0
                     crit_n = int(
-                        df_open_f[(df_open_f["Project"] == prj) & (df_open_f["Critical"] == True)].shape[0]
-                    ) if not df_open_f.empty else 0
+                        df_all_open[(df_all_open["Project"] == prj) & (df_all_open["Critical"] == True)].shape[0]
+                    ) if not df_all_open.empty else 0
                     st.markdown("**Counts**")
                     st.write(f"Open actions: **{open_n}**")
                     st.write(f"Critical open: **{crit_n}**")
 
                 # Placeholder Resource Utilization heatmap (task counts per month)
-                # Build owner assignment table for this project
                 if not df_owner_pairs_all.empty:
                     owners_map = df_owner_pairs_all[df_owner_pairs_all["Project"] == prj][["TaskUID", "Owner"]]
                     tproj = tdf.merge(owners_map, on="TaskUID", how="left")
                 else:
                     tproj = tdf.copy()
-                    # best-effort single owner from inline
                     tproj["Owner"] = (
                         tproj.get("ResourceNamesInline", "")
                         .astype(str).str.replace(";", ",").str.split(",").str[0].str.strip().fillna("Unassigned")
@@ -641,17 +650,16 @@ if not df_all_tasks.empty:
                 st.markdown("**Resource Utilization (placeholder)**")
                 if not util.empty:
                     pivot = util.pivot(index="Owner", columns="Month", values="Tasks").fillna(0)
-                    fig, ax = plt.subplots(figsize=(6, 3.6))
-                    im = ax.imshow(pivot.values, aspect="auto")
-                    ax.set_title("Task Count per Month (proxy for hours)")
-                    ax.set_yticks(range(len(pivot.index)))
-                    ax.set_yticklabels(pivot.index)
-                    ax.set_xticks(range(len(pivot.columns)))
-                    ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
+                    fig5, ax5 = plt.subplots(figsize=(6, 3.6))
+                    ax5.imshow(pivot.values, aspect="auto")
+                    ax5.set_title("Task Count per Month (proxy for hours)")
+                    ax5.set_yticks(range(len(pivot.index))); ax5.set_yticklabels(pivot.index)
+                    ax5.set_xticks(range(len(pivot.columns))); ax5.set_xticklabels(pivot.columns, rotation=45, ha="right")
+                    # annotate cells
                     for i in range(pivot.shape[0]):
                         for j in range(pivot.shape[1]):
-                            ax.text(j, i, int(pivot.values[i, j]), ha="center", va="center", fontsize=8)
-                    fig.tight_layout()
-                    st.pyplot(fig)
+                            ax5.text(j, i, int(pivot.values[i, j]), ha="center", va="center", fontsize=8)
+                    fig5.tight_layout()
+                    st.pyplot(fig5)
                 else:
                     st.caption("No data for utilization heatmap (placeholder).")
