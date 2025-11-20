@@ -528,7 +528,7 @@ if not df_all_tasks.empty:
                .sort_values("Month")
         )
         if not trend.empty:
-            fig4, ax4 = plt.subplots(figsize=(4, 2.6))
+            fig4, ax4 = plt.subplots(figsize=(10, 5.6))
             ax4.plot(trend["Month"], trend["OnTimePct"], marker="o")
             ax4.set_title("On-Time Completion % by Month")
             ax4.set_xlabel("Month")
