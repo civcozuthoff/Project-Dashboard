@@ -411,6 +411,79 @@ if not df_open_f.empty:
             ax2.tick_params(axis="x", rotation=45)
             fig2.tight_layout()
             st.pyplot(fig2)
+# ================= On-Time Completion =================
+st.subheader("On-Time Task Completion %")
+
+# Completed, non-summary tasks with both planned and actual dates
+if not df_all_tasks.empty:
+    dfc = df_all_tasks.copy()
+    dfc = dfc[
+        (~dfc["IsSummary"]) &
+        (dfc["ActualFinish"].notna()) &
+        (dfc["Finish"].notna())
+    ].copy()
+
+    # Choose planned date = BaselineFinish if available, else Finish
+    dfc["PlannedFinish"] = dfc["BaselineFinish"].where(dfc["BaselineFinish"].notna(), dfc["Finish"])
+
+    # On-time if ActualFinish <= PlannedFinish
+    dfc["OnTime"] = dfc["ActualFinish"] <= dfc["PlannedFinish"]
+
+    # Limit to filtered projects
+    dfc = dfc[dfc["Project"].isin(df_summary_f["ProjectName"])]
+
+    if not dfc.empty:
+        overall_pct = round(100 * dfc["OnTime"].mean(), 1)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Overall On-Time % (completed tasks)", f"{overall_pct}%")
+
+        # Per-project %
+        proj_rates = (
+            dfc.groupby("Project")["OnTime"]
+               .mean()
+               .mul(100)
+               .round(1)
+               .reset_index(name="OnTimePct")
+               .sort_values("OnTimePct", ascending=False)
+        )
+        with c2:
+            fig, ax = plt.subplots(figsize=(6, 3.6))
+            ax.bar(proj_rates["Project"], proj_rates["OnTimePct"])
+            ax.set_title("On-Time % by Project")
+            ax.set_xlabel("Project"); ax.set_ylabel("On-Time %")
+            ax.set_ylim(0, 100)
+            ax.tick_params(axis="x", rotation=45)
+            fig.tight_layout()
+            st.pyplot(fig)
+    else:
+        st.caption("No completed tasks with both Actual Finish and planned dates found.")
+else:
+    st.caption("No task data available yet.")
+
+        # Monthly trend of on-time completion
+        st.markdown("**Monthly Trend – On-Time Completion**")
+        dfc["Month"] = pd.to_datetime(dfc["ActualFinish"]).dt.to_period("M").astype(str)
+        trend = (
+            dfc.groupby("Month")["OnTime"]
+               .mean()
+               .mul(100)
+               .round(1)
+               .reset_index(name="OnTimePct")
+               .sort_values("Month")
+        )
+        if not trend.empty:
+            fig3, ax3 = plt.subplots(figsize=(6, 3.6))
+            ax3.plot(trend["Month"], trend["OnTimePct"], marker="o")
+            ax3.set_title("On-Time Completion % by Month")
+            ax3.set_xlabel("Month")
+            ax3.set_ylabel("On-Time %")
+            ax3.set_ylim(0, 100)
+            ax3.grid(True, alpha=0.3)
+            fig3.tight_layout()
+            st.pyplot(fig3)
+        else:
+            st.caption("No on-time completion trend data available.")
 
 # Placeholder for second chart spot if you want to add more
 with colD:
