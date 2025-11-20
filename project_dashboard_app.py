@@ -4,6 +4,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.dates import AutoDateLocator, ConciseDateFormatter  # NEW
+
+# Global plot font sizes (smaller than before)
+plt.rcParams.update({
+    "axes.titlesize": 10,   # was 12
+    "axes.labelsize": 8,    # was 10  -> minus 2
+    "xtick.labelsize": 8,   # was 9   -> minus 1 (tighter)
+    "ytick.labelsize": 8,
+    "legend.fontsize": 8
+})
 
 # ---------- App config & plot style ----------
 st.set_page_config(page_title="Project Portfolio Dashboard", layout="wide")
@@ -48,6 +59,30 @@ def parse_project_xml(file_like):
     finish_dt = parse_dt(gettext("msproj:FinishDate"))
     last_saved = parse_dt(gettext("msproj:LastSaved"))
     current_dt = parse_dt(gettext("msproj:CurrentDate")) or datetime.now()
+
+    from pathlib import Path
+
+def load_notes():
+    p = Path(NOTES_STORE)
+    if p.exists():
+        try:
+            return pd.read_csv(p)
+        except Exception:
+            return pd.DataFrame(columns=["Timestamp","Project","Author","Note"])
+    return pd.DataFrame(columns=["Timestamp","Project","Author","Note"])
+
+def append_note(project, author, note):
+    if not note.strip():
+        return
+    df = load_notes()
+    new = pd.DataFrame([{
+        "Timestamp": datetime.now().isoformat(timespec="seconds"),
+        "Project": project,
+        "Author": author.strip() or "Anonymous",
+        "Note": note.strip()
+    }])
+    out = pd.concat([df, new], ignore_index=True)
+    out.to_csv(NOTES_STORE, index=False)
 
     # --- Resources ---
     res_uid_to_name = {}
@@ -179,12 +214,22 @@ def kpi(label, value, help_text=None):
     if help_text: c.caption(help_text)
 
 def small_line(df, xcol, ycol, title):
-    fig, ax = plt.subplots(figsize=(4, 3))
+    fig, ax = plt.subplots(figsize=(6, 3.6))  # wider to prevent overlap; 2-across layout
     ax.plot(df[xcol], df[ycol], marker="o")
     ax.set_title(title)
     ax.set_xlabel(xcol)
     ax.set_ylabel(ycol)
     ax.grid(True, alpha=0.3)
+
+    # Smarter date ticks if x is datetime/date
+    try:
+        if np.issubdtype(pd.Series(df[xcol]).dtype, np.datetime64) or hasattr(df[xcol].iloc[0], "year"):
+            locator = AutoDateLocator()
+            ax.xaxis.set_major_locator(locator)
+            ax.xaxis.set_major_formatter(ConciseDateFormatter(locator))
+    except Exception:
+        pass
+
     fig.tight_layout()
     st.pyplot(fig)
 
@@ -306,125 +351,119 @@ if df_all_open is not None and not df_all_open.empty:
 else:
     df_open_f = pd.DataFrame()
 
-# ---------- 3-across charts ----------
-colA, colB, colC = st.columns(3)
+# ---- 2-across charts ----
+colA, colB = st.columns(2)
 
-# Portfolio Burndown
+# 1) Portfolio Burndown
 if not df_open_f.empty:
     bd_overall = (
-        df_open_f.dropna(subset=["Finish"])
-        .assign(FinishDate=lambda d: pd.to_datetime(d["Finish"]).dt.date)
-        .groupby("FinishDate")
-        .size()
-        .reset_index(name="OpenTasks")
+        df_open_f[~df_open_f["IsSummary"]]
+        .dropna(subset=["Finish"])
+        .assign(FinishDate=lambda d: pd.to_datetime(d["Finish"]).dt.to_period("M").dt.to_timestamp())
+        .groupby("FinishDate").size().reset_index(name="OpenTasks")
         .sort_values("FinishDate")
     )
     with colA:
         if not bd_overall.empty:
             small_line(bd_overall, "FinishDate", "OpenTasks", "Burndown — Portfolio (filtered)")
 
-# Owner Load (uses Assignments where available)
+# 2) Owner Load
 if not df_open_f.empty:
-    if not df_owner_pairs_all.empty:
-        owners_map = df_owner_pairs_all[df_owner_pairs_all["Project"].isin(df_summary_f["ProjectName"])][
-            ["TaskUID", "Owner"]
-        ]
-        tmp = df_open_f.merge(owners_map, on="TaskUID", how="left")
-        tmp["Owner"] = tmp["Owner"].fillna("Unassigned")
-    else:
-        tmp = df_open_f.copy()
-        tmp["Owner"] = tmp.get("ResourceNamesInline", "Unassigned")
-        tmp["Owner"] = tmp["Owner"].fillna("Unassigned")
-    owner_counts = (
-        tmp.groupby("Owner")["TaskUID"].count().sort_values(ascending=False).reset_index(name="OpenActions")
-    )
+    # (owner mapping stays the same)
     with colB:
-        fig, ax = plt.subplots(figsize=(4, 3))
+        fig, ax = plt.subplots(figsize=(6, 3.6))
         ax.bar(owner_counts["Owner"], owner_counts["OpenActions"])
         ax.set_title("Open Actions by Owner")
-        ax.set_xlabel("Owner")
-        ax.set_ylabel("OpenActions")
+        ax.set_xlabel("Owner"); ax.set_ylabel("OpenActions")
         ax.tick_params(axis="x", rotation=45)
         fig.tight_layout()
         st.pyplot(fig)
 
-# Aging buckets
-if not df_open_f.empty:
-    df_open_f["Finish"] = pd.to_datetime(df_open_f["Finish"], errors="coerce")
-    df_open_f["DaysLate"] = (today - df_open_f["Finish"]).dt.days
-
-    def bucket(d):
-        if pd.isna(d) or d < 0:
-            return "Not Due"
-        if d <= 7:
-            return "0–7"
-        if d <= 14:
-            return "8–14"
-        return ">14"
-
-    df_open_f["AgingBucket"] = df_open_f["DaysLate"].apply(bucket)
-    age_tbl = (
-        df_open_f[df_open_f["AgingBucket"] != "Not Due"]
-        .groupby(["Project", "AgingBucket"])
-        .size()
-        .reset_index(name="Tasks")
-        .pivot(index="Project", columns="AgingBucket", values="Tasks")
-        .fillna(0)
-        .reindex(columns=["0–7", "8–14", ">14"], fill_value=0)
-    )
-    with colC:
-        if not age_tbl.empty:
-            fig2, ax2 = plt.subplots(figsize=(4, 3))
-            bottom = np.zeros(len(age_tbl))
-            for col in age_tbl.columns:
-                vals = age_tbl[col].values
-                ax2.bar(age_tbl.index, vals, bottom=bottom, label=col)
-                bottom = bottom + vals
-            ax2.set_title("Aging by Project")
-            ax2.set_xlabel("Project")
-            ax2.set_ylabel("Tasks")
-            ax2.legend(title="Days Late")
-            ax2.tick_params(axis="x", rotation=45)
-            fig2.tight_layout()
-            st.pyplot(fig2)
+# 3) Aging buckets (next row, first column)
+colC, colD = st.columns(2)
+with colC:
+    if not age_tbl.empty:
+        fig2, ax2 = plt.subplots(figsize=(6, 3.6))
+        bottom = np.zeros(len(age_tbl))
+        for col in age_tbl.columns:
+            vals = age_tbl[col].values
+            ax2.bar(age_tbl.index, vals, bottom=bottom, label=col)
+            bottom = bottom + vals
+        ax2.set_title("Aging by Project")
+        ax2.set_xlabel("Project"); ax2.set_ylabel("Tasks")
+        ax2.legend(title="Days Late")
+        ax2.tick_params(axis="x", rotation=45)
+        fig2.tight_layout()
+        st.pyplot(fig2)
 
 # ---------- Focus: Late and Upcoming ----------
 st.subheader("Focus: Late and Upcoming")
 
-# Top 5 Late Tasks by duration (days late)
+# Top 5 Late Tasks by duration (days late) — exclude summaries, require open + named tasks
 if not df_open_f.empty:
-    late = df_open_f.copy()
+    late = df_open_f[~df_open_f["IsSummary"]].copy()
     late["Finish"] = pd.to_datetime(late["Finish"], errors="coerce")
-    late = late[late["Finish"].notna() & (late["Finish"] < today)]
+    late = late[
+        late["TaskName"].str.len() > 0 &
+        late["Finish"].notna() &
+        (late["Finish"] < today) &
+        (late["PercentComplete"] < 100) &
+        (late["ActualFinish"].isna())
+    ]
     if not late.empty:
         late["DaysLate"] = (today - late["Finish"]).dt.days
-        # attach owner when available
         if "Owner" not in late.columns and not df_owner_pairs_all.empty:
-            owners_map = df_owner_pairs_all[["TaskUID", "Owner"]]
+            owners_map = df_owner_pairs_all[["TaskUID","Owner"]]
             late = late.merge(owners_map, on="TaskUID", how="left")
         late["Owner"] = late.get("Owner", late.get("ResourceNamesInline", "Unassigned")).fillna("Unassigned")
-        late = late[late["TaskName"].str.len() > 0]  # EDIT #3: ensure names
         top5 = late.sort_values("DaysLate", ascending=False).head(5)
         st.markdown("**Top 5 Late Tasks (by days late)**")
-        st.dataframe(top5[["Project", "TaskName", "Owner", "Finish", "DaysLate", "Critical", "PercentComplete", "Notes"]])
+        st.dataframe(top5[["Project","TaskName","Owner","Finish","DaysLate","Critical","PercentComplete","Notes"]])
 
-# Next 3 upcoming actions per project (open + future finish)
+# Next 3 upcoming actions per project — exclude summaries, require open + future finish + name
 if not df_open_f.empty:
-    upcoming = df_open_f.copy()
+    upcoming = df_open_f[~df_open_f["IsSummary"]].copy()
     upcoming["Finish"] = pd.to_datetime(upcoming["Finish"], errors="coerce")
-    upcoming = upcoming[upcoming["Finish"].notna() & (upcoming["Finish"] >= today)]
+    upcoming = upcoming[
+        upcoming["TaskName"].str.len() > 0 &
+        upcoming["Finish"].notna() &
+        (upcoming["Finish"] >= today) &
+        (upcoming["PercentComplete"] < 100) &
+        (upcoming["ActualFinish"].isna())
+    ]
     if not upcoming.empty:
         st.markdown("**Next 3 Upcoming Actions per Project**")
         rows = []
         for prj, grp in upcoming.groupby("Project"):
-            g = grp.sort_values("Finish").head(3)
-            rows.append(g)
-        if rows:
-            nxt = pd.concat(rows, ignore_index=True)
-            show_cols = ["Project", "TaskName", "Finish", "Critical", "PercentComplete", "Notes"]
+            rows.append(grp.sort_values("Finish").head(3))
+        nxt = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+        if not nxt.empty:
+            show_cols = ["Project","TaskName","Finish","Critical","PercentComplete","Notes"]
             st.dataframe(nxt[show_cols])
 
 # ---------- Project Detail ----------
+st.subheader("Project Notes (shared)")
+note_col1, note_col2 = st.columns([2,3])
+
+with note_col1:
+    prj_for_note = st.selectbox("Select project", df_summary_f["ProjectName"].tolist())
+    author = st.text_input("Your name", value="")
+    note_text = st.text_area("Add a note (stored in a shared CSV)", height=80, placeholder="Type a short update or decision here…")
+    if st.button("Save note"):
+        append_note(prj_for_note, author, note_text)
+        st.success("Note saved.")
+
+with note_col2:
+    notes_df = load_notes()
+    if not notes_df.empty:
+        # Filter to selected project (toggle)
+        show_all = st.checkbox("Show all project notes", value=False)
+        if not show_all:
+            notes_df = notes_df[notes_df["Project"] == prj_for_note]
+        st.dataframe(notes_df.sort_values("Timestamp", ascending=False))
+    else:
+        st.caption("No notes yet. Be the first to add one!")
+
 st.subheader("Project Detail")
 if not df_all_tasks.empty:
     projs = [p for p in df_summary_f["ProjectName"].tolist() if p in df_all_tasks["Project"].unique().tolist()]
