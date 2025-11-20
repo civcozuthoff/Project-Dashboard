@@ -2,42 +2,82 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.dates import AutoDateLocator, ConciseDateFormatter
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from datetime import datetime
-import matplotlib.pyplot as plt
-from matplotlib.dates import AutoDateLocator, ConciseDateFormatter  # NEW
 
-# Global plot font sizes (smaller than before)
+# ================= App config & global plot style =================
+st.set_page_config(page_title="Project Portfolio Dashboard", layout="wide")
+
+# Smaller, cleaner typography
 plt.rcParams.update({
-    "axes.titlesize": 10,   # was 12
-    "axes.labelsize": 8,    # was 10  -> minus 2
-    "xtick.labelsize": 8,   # was 9   -> minus 1 (tighter)
+    "axes.titlesize": 10,
+    "axes.labelsize": 8,
+    "xtick.labelsize": 8,
     "ytick.labelsize": 8,
     "legend.fontsize": 8
 })
 
-# ---------- App config & plot style ----------
-st.set_page_config(page_title="Project Portfolio Dashboard", layout="wide")
-plt.rcParams.update({
-    "axes.titlesize": 12,
-    "axes.labelsize": 10,
-    "xtick.labelsize": 9,
-    "ytick.labelsize": 9,
-    "legend.fontsize": 9
-})
-
-# ---------- Helpers ----------
+# ================= Constants =================
 ns = {"msproj": "http://schemas.microsoft.com/project"}
+# Store team notes in a CSV (point this to a shared path/UNC to collaborate)
+NOTES_STORE = "dashboard_notes.csv"
 
+# ================= Utilities =================
 def parse_dt(s: str | None):
     if not s:
         return None
     try:
-        # MS Project XML can have trailing "Z"
+        # MS Project XML can have trailing 'Z'
         return datetime.fromisoformat(s.replace("Z", ""))
     except Exception:
         return None
 
+def load_notes():
+    p = Path(NOTES_STORE)
+    if p.exists():
+        try:
+            return pd.read_csv(p)
+        except Exception:
+            return pd.DataFrame(columns=["Timestamp", "Project", "Author", "Note"])
+    return pd.DataFrame(columns=["Timestamp", "Project", "Author", "Note"])
+
+def append_note(project: str, author: str, note: str):
+    if not note or not note.strip():
+        return
+    df = load_notes()
+    new = pd.DataFrame([{
+        "Timestamp": datetime.now().isoformat(timespec="seconds"),
+        "Project": (project or "").strip(),
+        "Author": (author or "Anonymous").strip(),
+        "Note": note.strip()
+    }])
+    out = pd.concat([df, new], ignore_index=True)
+    out.to_csv(NOTES_STORE, index=False)
+
+def small_line(df, xcol, ycol, title):
+    fig, ax = plt.subplots(figsize=(6, 3.6))  # 2-across layout
+    ax.plot(df[xcol], df[ycol], marker="o")
+    ax.set_title(title)
+    ax.set_xlabel(xcol)
+    ax.set_ylabel(ycol)
+    ax.grid(True, alpha=0.3)
+
+    # Concise datetime ticks if applicable
+    try:
+        series = pd.Series(df[xcol])
+        if pd.api.types.is_datetime64_any_dtype(series) or hasattr(series.iloc[0], "year"):
+            locator = AutoDateLocator()
+            ax.xaxis.set_major_locator(locator)
+            ax.xaxis.set_major_formatter(ConciseDateFormatter(locator))
+    except Exception:
+        pass
+
+    fig.tight_layout()
+    st.pyplot(fig)
+
+# ================= XML Parsing =================
 def parse_project_xml(file_like):
     """
     Returns:
@@ -60,31 +100,7 @@ def parse_project_xml(file_like):
     last_saved = parse_dt(gettext("msproj:LastSaved"))
     current_dt = parse_dt(gettext("msproj:CurrentDate")) or datetime.now()
 
-    from pathlib import Path
-
-def load_notes():
-    p = Path(NOTES_STORE)
-    if p.exists():
-        try:
-            return pd.read_csv(p)
-        except Exception:
-            return pd.DataFrame(columns=["Timestamp","Project","Author","Note"])
-    return pd.DataFrame(columns=["Timestamp","Project","Author","Note"])
-
-def append_note(project, author, note):
-    if not note.strip():
-        return
-    df = load_notes()
-    new = pd.DataFrame([{
-        "Timestamp": datetime.now().isoformat(timespec="seconds"),
-        "Project": project,
-        "Author": author.strip() or "Anonymous",
-        "Note": note.strip()
-    }])
-    out = pd.concat([df, new], ignore_index=True)
-    out.to_csv(NOTES_STORE, index=False)
-
-    # --- Resources ---
+    # ---- Resources ----
     res_uid_to_name = {}
     for r in root.findall("msproj:Resources/msproj:Resource", ns):
         uid = r.find("msproj:UID", ns)
@@ -92,7 +108,7 @@ def append_note(project, author, note):
         if uid is not None and nm is not None and uid.text:
             res_uid_to_name[uid.text] = nm.text
 
-    # --- Tasks ---
+    # ---- Tasks ----
     tasks = []
     for t in root.findall("msproj:Tasks/msproj:Task", ns):
         uid_el = t.find("msproj:UID", ns)
@@ -104,7 +120,7 @@ def append_note(project, author, note):
             return el.text if el is not None and el.text is not None else default
 
         task_name = (tg("Name", "") or "").strip()
-        if task_name == "":  # EDIT #3: skip tasks without a name
+        if task_name == "":  # Exclude unnamed tasks
             continue
 
         summary = (tg("Summary", "0") == "1")
@@ -112,7 +128,7 @@ def append_note(project, author, note):
         active = (tg("Active", "1") == "1")
         start_task = parse_dt(tg("Start"))
         finish_task = parse_dt(tg("Finish"))
-        actual_finish = parse_dt(tg("ActualFinish"))  # EDIT #2
+        actual_finish = parse_dt(tg("ActualFinish"))
         critical = (tg("Critical", "0") == "1")
         milestone = (tg("Milestone", "0") == "1")
         notes = tg("Notes", "")
@@ -124,7 +140,7 @@ def append_note(project, author, note):
             if puid is not None and puid.text:
                 preds.append(puid.text)
 
-        # EDIT #2: open = not summary, active, <100%, and no ActualFinish recorded
+        # Strict "open": not summary, active, <100%, and no ActualFinish
         is_open = (not summary) and active and (percent < 100.0) and (actual_finish is None)
 
         tasks.append({
@@ -148,7 +164,7 @@ def append_note(project, author, note):
 
     df_tasks = pd.DataFrame(tasks)
 
-    # --- Assignments → Owners map (most reliable) ---
+    # ---- Assignments → Owner mapping ----
     pairs = []
     for a in root.findall("msproj:Assignments/msproj:Assignment", ns):
         tu = a.find("msproj:TaskUID", ns)
@@ -160,7 +176,7 @@ def append_note(project, author, note):
             pairs.append({"TaskUID": t_uid, "Owner": res_uid_to_name[r_uid]})
     df_pairs = pd.DataFrame(pairs)
 
-    # Fallback: split inline ResourceNames (if no assignments)
+    # Fallback to inline names if no assignments
     if df_pairs.empty and not df_tasks.empty:
         tmp = df_tasks[["TaskUID", "ResourceNamesInline"]].dropna()
         rows = []
@@ -171,18 +187,17 @@ def append_note(project, author, note):
                     rows.append({"TaskUID": r["TaskUID"], "Owner": nm})
         df_pairs = pd.DataFrame(rows)
 
-    # --- Open, late, crit rollups ---
+    # ---- Open/Late/Critical rollups ----
     non_summary = df_tasks[~df_tasks["IsSummary"]] if not df_tasks.empty else df_tasks
     open_actions = non_summary[non_summary["IsOpenAction"]] if not non_summary.empty else non_summary
 
-    # Late = open and finish < today
     late_open = open_actions.copy()
     late_open = late_open[late_open["Finish"].notna() & (late_open["Finish"] < current_dt)]
-
     crit_open = open_actions[open_actions["Critical"] == True]
+
     overall_pct = round(non_summary["PercentComplete"].mean(), 1) if not non_summary.empty else 0.0
 
-    # Bull/Bear dates
+    # Bull/Bear
     bull_finish = finish_dt
     if not crit_open.empty and crit_open["Finish"].notna().any():
         bear_finish = crit_open["Finish"].max()
@@ -208,32 +223,10 @@ def append_note(project, author, note):
     }
     return summary, open_actions, df_tasks, df_pairs
 
-def kpi(label, value, help_text=None):
-    c = st.container()
-    c.metric(label, value)
-    if help_text: c.caption(help_text)
+# ================= App Body =================
+st.title("Project Portfolio Dashboard")
 
-def small_line(df, xcol, ycol, title):
-    fig, ax = plt.subplots(figsize=(6, 3.6))  # wider to prevent overlap; 2-across layout
-    ax.plot(df[xcol], df[ycol], marker="o")
-    ax.set_title(title)
-    ax.set_xlabel(xcol)
-    ax.set_ylabel(ycol)
-    ax.grid(True, alpha=0.3)
-
-    # Smarter date ticks if x is datetime/date
-    try:
-        if np.issubdtype(pd.Series(df[xcol]).dtype, np.datetime64) or hasattr(df[xcol].iloc[0], "year"):
-            locator = AutoDateLocator()
-            ax.xaxis.set_major_locator(locator)
-            ax.xaxis.set_major_formatter(ConciseDateFormatter(locator))
-    except Exception:
-        pass
-
-    fig.tight_layout()
-    st.pyplot(fig)
-
-# ---------- Data Source ----------
+# ---- Data Source ----
 st.sidebar.header("Data Source")
 mode = st.sidebar.radio("Choose data source:", ["Upload XML files", "Upload Excel export"])
 
@@ -287,7 +280,7 @@ if df_summary.empty:
 
 today = datetime.now()
 
-# ---------- Status classification ----------
+# ---- Status classification ----
 def classify_status(row):
     if row.get("LateOpenActions", 0) > 0:
         return "Late"
@@ -305,14 +298,14 @@ def classify_status(row):
 
 df_summary["Status"] = df_summary.apply(classify_status, axis=1)
 
-# ---------- KPIs ----------
+# ---- KPI Row ----
 c1, c2, c3, c4 = st.columns(4)
-with c1: kpi("Total Projects", len(df_summary))
-with c2: kpi("Total Open Actions", int(df_summary["OpenActions"].sum()))
-with c3: kpi("Critical Open Actions", int(df_summary["CriticalOpenActions"].sum()))
-with c4: kpi("Late Open Actions", int(df_summary["LateOpenActions"].sum()))
+with c1: st.metric("Total Projects", len(df_summary))
+with c2: st.metric("Total Open Actions", int(df_summary["OpenActions"].sum()))
+with c3: st.metric("Critical Open Actions", int(df_summary["CriticalOpenActions"].sum()))
+with c4: st.metric("Late Open Actions", int(df_summary["LateOpenActions"].sum()))
 
-# ---------- Status table ----------
+# ---- Status Table ----
 st.subheader("Project Status")
 st.dataframe(
     df_summary[
@@ -330,31 +323,28 @@ st.dataframe(
     ]
 )
 
-# ---------- Filters ----------
+# ---- Filters ----
 st.sidebar.header("Filters")
 status_filter = st.sidebar.multiselect(
-    "Status",
-    options=df_summary["Status"].unique().tolist(),
-    default=df_summary["Status"].unique().tolist(),
+    "Status", options=df_summary["Status"].unique().tolist(),
+    default=df_summary["Status"].unique().tolist()
 )
 proj_filter = st.sidebar.multiselect(
-    "Projects",
-    options=df_summary["ProjectName"].tolist(),
-    default=df_summary["ProjectName"].tolist(),
+    "Projects", options=df_summary["ProjectName"].tolist(),
+    default=df_summary["ProjectName"].tolist()
 )
 
-df_summary_f = df_summary[
-    df_summary["Status"].isin(status_filter) & df_summary["ProjectName"].isin(proj_filter)
-]
+df_summary_f = df_summary[df_summary["Status"].isin(status_filter) & df_summary["ProjectName"].isin(proj_filter)]
+
 if df_all_open is not None and not df_all_open.empty:
     df_open_f = df_all_open[df_all_open["Project"].isin(df_summary_f["ProjectName"])].copy()
 else:
     df_open_f = pd.DataFrame()
 
-# ---- 2-across charts ----
+# ================= Charts (2 across) =================
 colA, colB = st.columns(2)
 
-# 1) Portfolio Burndown
+# Portfolio Burndown (month buckets for readability)
 if not df_open_f.empty:
     bd_overall = (
         df_open_f[~df_open_f["IsSummary"]]
@@ -367,9 +357,16 @@ if not df_open_f.empty:
         if not bd_overall.empty:
             small_line(bd_overall, "FinishDate", "OpenTasks", "Burndown — Portfolio (filtered)")
 
-# 2) Owner Load
+# Owner Load (Assignments preferred)
 if not df_open_f.empty:
-    # (owner mapping stays the same)
+    if not df_owner_pairs_all.empty:
+        owners_map = df_owner_pairs_all[df_owner_pairs_all["Project"].isin(df_summary_f["ProjectName"])][["TaskUID", "Owner"]]
+        tmp = df_open_f.merge(owners_map, on="TaskUID", how="left")
+        tmp["Owner"] = tmp["Owner"].fillna("Unassigned")
+    else:
+        tmp = df_open_f.copy()
+        tmp["Owner"] = tmp.get("ResourceNamesInline", "Unassigned").fillna("Unassigned")
+    owner_counts = tmp[~tmp["IsSummary"]].groupby("Owner")["TaskUID"].count().sort_values(ascending=False).reset_index(name="OpenActions")
     with colB:
         fig, ax = plt.subplots(figsize=(6, 3.6))
         ax.bar(owner_counts["Owner"], owner_counts["OpenActions"])
@@ -379,32 +376,55 @@ if not df_open_f.empty:
         fig.tight_layout()
         st.pyplot(fig)
 
-# 3) Aging buckets (next row, first column)
+# Next row
 colC, colD = st.columns(2)
-with colC:
-    if not age_tbl.empty:
-        fig2, ax2 = plt.subplots(figsize=(6, 3.6))
-        bottom = np.zeros(len(age_tbl))
-        for col in age_tbl.columns:
-            vals = age_tbl[col].values
-            ax2.bar(age_tbl.index, vals, bottom=bottom, label=col)
-            bottom = bottom + vals
-        ax2.set_title("Aging by Project")
-        ax2.set_xlabel("Project"); ax2.set_ylabel("Tasks")
-        ax2.legend(title="Days Late")
-        ax2.tick_params(axis="x", rotation=45)
-        fig2.tight_layout()
-        st.pyplot(fig2)
 
-# ---------- Focus: Late and Upcoming ----------
+# Aging buckets
+if not df_open_f.empty:
+    df_open_f["Finish"] = pd.to_datetime(df_open_f["Finish"], errors="coerce")
+    df_open_f["DaysLate"] = (today - df_open_f["Finish"]).dt.days
+
+    def bucket(d):
+        if pd.isna(d) or d < 0: return "Not Due"
+        if d <= 7: return "0–7"
+        if d <= 14: return "8–14"
+        return ">14"
+
+    df_open_f["AgingBucket"] = df_open_f["DaysLate"].apply(bucket)
+    age_tbl = (
+        df_open_f[(df_open_f["AgingBucket"] != "Not Due") & (~df_open_f["IsSummary"])]
+        .groupby(["Project", "AgingBucket"]).size().reset_index(name="Tasks")
+        .pivot(index="Project", columns="AgingBucket", values="Tasks").fillna(0)
+        .reindex(columns=["0–7", "8–14", ">14"], fill_value=0)
+    )
+    with colC:
+        if not age_tbl.empty:
+            fig2, ax2 = plt.subplots(figsize=(6, 3.6))
+            bottom = np.zeros(len(age_tbl))
+            for col in age_tbl.columns:
+                vals = age_tbl[col].values
+                ax2.bar(age_tbl.index, vals, bottom=bottom, label=col)
+                bottom = bottom + vals
+            ax2.set_title("Aging by Project")
+            ax2.set_xlabel("Project"); ax2.set_ylabel("Tasks")
+            ax2.legend(title="Days Late")
+            ax2.tick_params(axis="x", rotation=45)
+            fig2.tight_layout()
+            st.pyplot(fig2)
+
+# Placeholder for second chart spot if you want to add more
+with colD:
+    st.empty()
+
+# ================= Focus: Late & Upcoming =================
 st.subheader("Focus: Late and Upcoming")
 
-# Top 5 Late Tasks by duration (days late) — exclude summaries, require open + named tasks
+# Top 5 Late (strict open, not summary, named)
 if not df_open_f.empty:
     late = df_open_f[~df_open_f["IsSummary"]].copy()
     late["Finish"] = pd.to_datetime(late["Finish"], errors="coerce")
     late = late[
-        late["TaskName"].str.len() > 0 &
+        (late["TaskName"].str.len() > 0) &
         late["Finish"].notna() &
         (late["Finish"] < today) &
         (late["PercentComplete"] < 100) &
@@ -413,19 +433,19 @@ if not df_open_f.empty:
     if not late.empty:
         late["DaysLate"] = (today - late["Finish"]).dt.days
         if "Owner" not in late.columns and not df_owner_pairs_all.empty:
-            owners_map = df_owner_pairs_all[["TaskUID","Owner"]]
-            late = late.merge(owners_map, on="TaskUID", how="left")
+            owners_map_all = df_owner_pairs_all[["TaskUID", "Owner"]]
+            late = late.merge(owners_map_all, on="TaskUID", how="left")
         late["Owner"] = late.get("Owner", late.get("ResourceNamesInline", "Unassigned")).fillna("Unassigned")
         top5 = late.sort_values("DaysLate", ascending=False).head(5)
         st.markdown("**Top 5 Late Tasks (by days late)**")
         st.dataframe(top5[["Project","TaskName","Owner","Finish","DaysLate","Critical","PercentComplete","Notes"]])
 
-# Next 3 upcoming actions per project — exclude summaries, require open + future finish + name
+# Next 3 upcoming per project (strict open, not summary, named)
 if not df_open_f.empty:
     upcoming = df_open_f[~df_open_f["IsSummary"]].copy()
     upcoming["Finish"] = pd.to_datetime(upcoming["Finish"], errors="coerce")
     upcoming = upcoming[
-        upcoming["TaskName"].str.len() > 0 &
+        (upcoming["TaskName"].str.len() > 0) &
         upcoming["Finish"].notna() &
         (upcoming["Finish"] >= today) &
         (upcoming["PercentComplete"] < 100) &
@@ -441,22 +461,19 @@ if not df_open_f.empty:
             show_cols = ["Project","TaskName","Finish","Critical","PercentComplete","Notes"]
             st.dataframe(nxt[show_cols])
 
-# ---------- Project Detail ----------
+# ================= Project Notes (shared) =================
 st.subheader("Project Notes (shared)")
-note_col1, note_col2 = st.columns([2,3])
-
+note_col1, note_col2 = st.columns([2, 3])
 with note_col1:
     prj_for_note = st.selectbox("Select project", df_summary_f["ProjectName"].tolist())
     author = st.text_input("Your name", value="")
-    note_text = st.text_area("Add a note (stored in a shared CSV)", height=80, placeholder="Type a short update or decision here…")
+    note_text = st.text_area("Add a note (stored in a shared CSV)", height=80, placeholder="Type an update or decision…")
     if st.button("Save note"):
         append_note(prj_for_note, author, note_text)
         st.success("Note saved.")
-
 with note_col2:
     notes_df = load_notes()
     if not notes_df.empty:
-        # Filter to selected project (toggle)
         show_all = st.checkbox("Show all project notes", value=False)
         if not show_all:
             notes_df = notes_df[notes_df["Project"] == prj_for_note]
@@ -464,23 +481,27 @@ with note_col2:
     else:
         st.caption("No notes yet. Be the first to add one!")
 
+# ================= Project Detail =================
 st.subheader("Project Detail")
 if not df_all_tasks.empty:
-    projs = [p for p in df_summary_f["ProjectName"].tolist() if p in df_all_tasks["Project"].unique().tolist()]
+    projs = [p for p in df_summary_f["ProjectName"].tolist()
+             if p in df_all_tasks["Project"].unique().tolist()]
     if projs:
         tabs = st.tabs(projs)
         for tab, prj in zip(tabs, projs):
             with tab:
                 tdf = df_all_tasks[df_all_tasks["Project"] == prj].copy()
 
-                # Owners list for this project (EDIT #5)
+                # Project Resources list
                 if not df_owner_pairs_all.empty:
                     owners_list = (
-                        df_owner_pairs_all[df_owner_pairs_all["Project"] == prj]["Owner"].dropna().unique().tolist()
+                        df_owner_pairs_all[df_owner_pairs_all["Project"] == prj]["Owner"]
+                        .dropna().unique().tolist()
                     )
                 else:
                     inline = (
-                        tdf["ResourceNamesInline"].dropna().astype(str).str.replace(";", ",").str.split(",").explode()
+                        tdf["ResourceNamesInline"].dropna()
+                        .astype(str).str.replace(";", ",").str.split(",").explode()
                     )
                     owners_list = sorted({s.strip() for s in inline if s and s.strip()})
 
@@ -490,96 +511,74 @@ if not df_all_tasks.empty:
                 else:
                     st.caption("No resources found for this project.")
 
-                # EDIT #4: Bull/Bear block moved above Critical Path
+                # Bull/Bear FIRST (moved above Critical Path)
                 row = df_summary[df_summary["ProjectName"] == prj].iloc[0]
                 st.markdown("**Bull / Bear Finish**")
                 st.caption("Bull = planned finish; Bear = latest finish among open critical tasks (else open tasks/planned).")
                 st.write(f"**Bull:** {row.get('BullFinish')}")
                 st.write(f"**Bear:** {row.get('BearFinish')}")
 
-                # Critical Path table (MSP-calculated 'Critical' flag)
+                # Critical Path (as flagged by MS Project)
                 crit = tdf[(tdf["Critical"] == True) & (~tdf["IsSummary"])].copy()
                 crit = crit.sort_values(["Finish", "Start", "TaskName"])
                 st.markdown("**Critical Path (MS Project 'Critical' tasks):**")
-                st.dataframe(crit[["TaskUID", "TaskName", "Start", "Finish", "PercentComplete"]])
+                st.dataframe(crit[["TaskUID","TaskName","Start","Finish","PercentComplete"]])
 
-                # Mini 3-across inside the tab (burndown + counts + placeholder heatmap per project)
-                cta, ctb, ctc = st.columns(3)
+                # Mini 2-across inside the tab: burndown + counts + placeholder heatmap
+                cta, ctb = st.columns(2)
 
                 with cta:
                     odf = df_open_f[df_open_f["Project"] == prj].dropna(subset=["Finish"])
                     if not odf.empty:
                         bd = (
-                            odf.assign(FinishDate=lambda d: pd.to_datetime(d["Finish"]).dt.date)
-                            .groupby("FinishDate")
-                            .size()
-                            .reset_index(name="OpenTasks")
+                            odf.assign(FinishDate=lambda d: pd.to_datetime(d["Finish"]).dt.to_period("M").dt.to_timestamp())
+                            .groupby("FinishDate").size().reset_index(name="OpenTasks")
                             .sort_values("FinishDate")
                         )
                         small_line(bd, "FinishDate", "OpenTasks", "Burndown")
 
                 with ctb:
                     open_n = int(df_open_f[df_open_f["Project"] == prj].shape[0]) if not df_open_f.empty else 0
-                    crit_n = (
-                        int((df_open_f[(df_open_f["Project"] == prj) & (df_open_f["Critical"] == True)]).shape[0])
-                        if not df_open_f.empty
-                        else 0
-                    )
+                    crit_n = int(
+                        df_open_f[(df_open_f["Project"] == prj) & (df_open_f["Critical"] == True)].shape[0]
+                    ) if not df_open_f.empty else 0
                     st.markdown("**Counts**")
                     st.write(f"Open actions: **{open_n}**")
                     st.write(f"Critical open: **{crit_n}**")
 
-                with ctc:
-                    # EDIT #6: Placeholder resource utilization heatmap (task counts per month)
-                    # Build owner assignment table for this project
-                    if not df_owner_pairs_all.empty:
-                        owners_map = df_owner_pairs_all[df_owner_pairs_all["Project"] == prj][["TaskUID", "Owner"]]
-                        tproj = tdf.merge(owners_map, on="TaskUID", how="left")
-                    else:
-                        tproj = tdf.copy()
-                        tproj["Owner"] = (
-                            tproj.get("ResourceNamesInline", "")
-                            .astype(str).str.replace(";", ",").str.split(",").str[0].str.strip().fillna("Unassigned")
-                        )
-
-                    # Month from Start (fallback to Finish)
-                    dates = pd.to_datetime(tproj["Start"]).fillna(pd.to_datetime(tproj["Finish"]))
-                    tproj = tproj.assign(Month=dates.dt.to_period("M").astype(str))
-                    util = (
-                        tproj[(~tproj["IsSummary"]) & (tproj["TaskName"].str.len() > 0)]
-                        .groupby(["Owner", "Month"]).size().reset_index(name="Tasks")
+                # Placeholder Resource Utilization heatmap (task counts per month)
+                # Build owner assignment table for this project
+                if not df_owner_pairs_all.empty:
+                    owners_map = df_owner_pairs_all[df_owner_pairs_all["Project"] == prj][["TaskUID", "Owner"]]
+                    tproj = tdf.merge(owners_map, on="TaskUID", how="left")
+                else:
+                    tproj = tdf.copy()
+                    # best-effort single owner from inline
+                    tproj["Owner"] = (
+                        tproj.get("ResourceNamesInline", "")
+                        .astype(str).str.replace(";", ",").str.split(",").str[0].str.strip().fillna("Unassigned")
                     )
-                    if not util.empty:
-                        pivot = util.pivot(index="Owner", columns="Month", values="Tasks").fillna(0)
-                        fig, ax = plt.subplots(figsize=(4, 3))
-                        im = ax.imshow(pivot.values, aspect="auto")
-                        ax.set_title("Resource Util. (placeholder)")
-                        ax.set_yticks(range(len(pivot.index)))
-                        ax.set_yticklabels(pivot.index)
-                        ax.set_xticks(range(len(pivot.columns)))
-                        ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
-                        # annotate
-                        for i in range(pivot.shape[0]):
-                            for j in range(pivot.shape[1]):
-                                ax.text(j, i, int(pivot.values[i, j]), ha="center", va="center", fontsize=9)
-                        fig.tight_layout()
-                        st.pyplot(fig)
-                    else:
-                        st.caption("No data for resource utilization heatmap (placeholder).")
 
-# ---------- Portfolio-wide Resource Workload (EDIT #5) ----------
-st.subheader("Portfolio Resource Workload (open actions)")
-if not df_open_f.empty:
-    if not df_owner_pairs_all.empty:
-        owners_map_all = df_owner_pairs_all[["TaskUID", "Owner", "Project"]]
-        tmp = df_open_f.merge(owners_map_all, on=["TaskUID", "Project"], how="left")
-        tmp["Owner"] = tmp["Owner"].fillna("Unassigned")
-    else:
-        tmp = df_open_f.copy()
-        tmp["Owner"] = tmp.get("ResourceNamesInline", "Unassigned").fillna("Unassigned")
-
-    workload = (
-        tmp.groupby(["Owner", "Project"])["TaskUID"].count().reset_index(name="OpenActions")
-        .sort_values(["Owner", "OpenActions"], ascending=[True, False])
-    )
-    st.dataframe(workload)
+                dates = pd.to_datetime(tproj["Start"]).fillna(pd.to_datetime(tproj["Finish"]))
+                tproj = tproj.assign(Month=dates.dt.to_period("M").astype(str))
+                util = (
+                    tproj[(~tproj["IsSummary"]) & (tproj["TaskName"].str.len() > 0)]
+                    .groupby(["Owner", "Month"]).size().reset_index(name="Tasks")
+                )
+                st.markdown("**Resource Utilization (placeholder)**")
+                if not util.empty:
+                    pivot = util.pivot(index="Owner", columns="Month", values="Tasks").fillna(0)
+                    fig, ax = plt.subplots(figsize=(6, 3.6))
+                    im = ax.imshow(pivot.values, aspect="auto")
+                    ax.set_title("Task Count per Month (proxy for hours)")
+                    ax.set_yticks(range(len(pivot.index)))
+                    ax.set_yticklabels(pivot.index)
+                    ax.set_xticks(range(len(pivot.columns)))
+                    ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
+                    for i in range(pivot.shape[0]):
+                        for j in range(pivot.shape[1]):
+                            ax.text(j, i, int(pivot.values[i, j]), ha="center", va="center", fontsize=8)
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                else:
+                    st.caption("No data for utilization heatmap (placeholder).")
