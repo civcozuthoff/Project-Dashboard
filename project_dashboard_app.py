@@ -490,7 +490,7 @@ if not df_all_tasks.empty:
         open_all = open_all.assign(Month=dates.dt.to_period("M").astype(str))
         util = open_all.groupby(["Owner", "Month"]).size().reset_index(name="Tasks")
         pivot = util.pivot(index="Owner", columns="Month", values="Tasks").fillna(0)
-        figU, axU = plt.subplots(figsize=(10, 6))
+        figU, axU = plt.subplots(figsize=(20, 12))
         im = axU.imshow(pivot.values, aspect="auto")
         axU.set_title("Open Task Count per Resource per Month (proxy for hours)")
         axU.set_yticks(range(len(pivot.index))); axU.set_yticklabels(pivot.index)
@@ -534,7 +534,7 @@ if not df_all_tasks.empty:
                 )
                 # quick workload by project
                 w = my_open.groupby("Project")["TaskUID"].count().reset_index(name="OpenActions").sort_values("OpenActions", ascending=False)
-                figW, axW = plt.subplots(figsize=(6, 3.6))
+                figW, axW = plt.subplots(figsize=(12, 7))
                 axW.bar(w["Project"], w["OpenActions"])
                 axW.set_title("Open Actions by Project")
                 axW.set_xlabel("Project"); axW.set_ylabel("OpenActions")
